@@ -1,0 +1,42 @@
+# Web mining service: RSS-first article pipeline with optional Tavily enrichment.
+# No torch / ML models. Slim image (~250MB).
+#
+# Build from ml-eng/:
+#   docker build -f Dockerfile.webminer -t opentrace-webminer:latest .
+#
+# Required env at runtime (see scripts/webminer-entrypoint.sh):
+#   MINING_COUNTRIES    — e.g. "Nigeria,Ghana,Kenya,Rwanda"
+#   MINING_OUTPUT_DIR   — where .txt articles are written (default: /data/web_news_rss)
+#
+# Optional:
+#   MINING_START_YEAR / MINING_END_YEAR  (default: current year)
+#   MINING_START_DATE / MINING_END_DATE  (overrides year-based window)
+#   MINING_MAX_URLS_PER_COUNTRY (default: 500)
+#   TAVILY_API_KEY               (enables Tavily enrichment for thin articles)
+#   SEARXNG_URL                  (self-hosted search; used by pipeline if set)
+
+FROM python:3.11-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.webminer.txt requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY ml ./ml
+COPY scripts/webminer-entrypoint.sh /app/scripts/webminer-entrypoint.sh
+RUN chmod +x /app/scripts/webminer-entrypoint.sh
+
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+# Default output directory (mount a Railway volume here for persistence)
+ENV MINING_OUTPUT_DIR=/data/web_news_rss
+VOLUME ["/data/web_news_rss"]
+
+ENTRYPOINT ["/app/scripts/webminer-entrypoint.sh"]
