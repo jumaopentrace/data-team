@@ -25,6 +25,7 @@ from ml.rag.chatbot.active_request import (
     resolve_turn,
     resolved_request_text,
 )
+from ml.rag.chatbot.agri_entities import CROP_ENTITY_RE
 from ml.rag.chatbot.agri_measure_ontology import (
     MEASURES,
     MeasureHit,
@@ -109,6 +110,7 @@ from ml.rag.chatbot.facet_compiler import compile_breakdown, compile_turn_contra
 from ml.rag.chatbot.facet_enrich import enrich_decomposition_facets
 from ml.rag.chatbot.generation_plan import build_generation_plan
 from ml.rag.chatbot.generator import (
+    GenerationResult,
     _generate_max_tokens,
     drop_geo_conflicting,
     drop_price_off_topic,
@@ -3227,6 +3229,68 @@ def node_generate_language_help(state: RAGGraphState) -> RAGGraphState:
     }
 
 
+# --- Experimental: self-correcting RAG for the empty-evidence fallback -----
+# Prototype only (experiment/self-correcting-rag branch) — not wired into
+# node_generate yet. See brainstorm: generate a draft from the model's own
+# knowledge when retrieval found nothing, extract candidate entities from the
+# draft with cheap regexes (reusing existing extractors, not a new NLP call),
+# and retry retrieval seeded with those terms before falling back to the
+# labeled ungrounded draft.
+
+def _is_empty_evidence_result(gen_result: GenerationResult, context: list[dict[str, Any]]) -> bool:
+    """True only for the genuinely-empty case, not weak/partial evidence."""
+    acf = gen_result.acf
+    return bool(acf and acf.band == "no_evidence" and not filter_context_items(list(context or [])))
+
+
+def _extract_draft_seed_terms(
+    draft_answer: str,
+    query: str,
+    decomposition: dict[str, Any] | None,
+) -> list[str]:
+    """Cheap, regex-based seed terms from a draft answer for a second-chance retrieval pass.
+
+    Reuses the same extractors the decomposer already relies on (CROP_ENTITY_RE,
+    _extract_countries) instead of a new NLP/LLM call. Falls back to whatever the
+    original decomposition already found when the draft adds nothing new, so the
+    second pass is never narrower than the first.
+    """
+    text = f"{query}\n{draft_answer or ''}"
+
+    crops = {m.group(1).lower() for m in CROP_ENTITY_RE.finditer(text)}
+    countries = set(_extract_countries(text))
+
+    seed_terms = sorted(crops | countries)
+
+    if not seed_terms and isinstance(decomposition, dict):
+        existing = decomposition.get("entities")
+        if isinstance(existing, list):
+            seed_terms = [str(e).strip() for e in existing if str(e or "").strip()]
+
+    return seed_terms
+
+
+def _second_chance_retrieve(state: RAGGraphState, seed_terms: list[str]) -> list[dict[str, Any]]:
+    """Re-run retrieve → merge → rerank with decomposition.entities widened by seed_terms.
+
+    Reuses the real pipeline nodes as-is (same BQ/Qdrant legs, same merge and
+    rerank logic the main path uses) instead of reimplementing retrieval —
+    the only new thing is the seeded decomposition fed into them.
+    """
+    if not seed_terms:
+        return []
+
+    dec = dict(state.get("decomposition") or {})
+    entities = list(dec.get("entities") or [])
+    dec["entities"] = list(dict.fromkeys(entities + seed_terms))  # dedupe, preserve order
+
+    retry_state: RAGGraphState = {**state, "decomposition": dec}
+    retry_state = {**retry_state, **node_retrieve_legs(retry_state)}
+    retry_state = {**retry_state, **node_merge(retry_state)}
+    retry_state = {**retry_state, **node_rerank(retry_state)}
+    return filter_context_items(retry_state.get("reranked_context") or [])
+
+
 def node_generate(state: RAGGraphState) -> RAGGraphState:
     query = state.get("query") or ""
     dec = state.get("decomposition")
@@ -3525,6 +3589,25 @@ def node_generate(state: RAGGraphState) -> RAGGraphState:
         gkw["composer_addendum"] = "\n\n".join(filter(None, (gkw.get("composer_addendum"), report_guidance)))
     gen_t0 = time.perf_counter()
     gen_result = generate(query, context, **gkw)
+
+    # Experimental self-correcting fallback (experiment/self-correcting-rag):
+    # only fires when retrieval found genuinely nothing. Generate an
+    # ungrounded draft from the model's own knowledge (reuses the existing
+    # weak-mode prompt/ACF labeling as-is), seed a second retrieval pass with
+    # terms pulled from that draft, and regenerate normally if it finds
+    # anything; otherwise keep the labeled ungrounded draft.
+    if _is_empty_evidence_result(gen_result, context):
+        sc_draft = generate(query, [], generate_weak=True, **gkw)
+        if sc_draft.answer:
+            seed_terms = _extract_draft_seed_terms(sc_draft.answer, str(query), dec_dict)
+            sc_context = _second_chance_retrieve(state, seed_terms)
+            if sc_context:
+                context = sc_context
+                reranked = sc_context
+                gen_result = generate(query, context, **gkw)
+            else:
+                gen_result = sc_draft
+
     draft_answer = str(gen_result.answer or "")
     job = ""
     if isinstance(tc_raw, dict):
